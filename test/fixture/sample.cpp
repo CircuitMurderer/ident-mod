@@ -2,6 +2,11 @@
 
 namespace project {
 
+template <>
+int inlineTemplate<int>(int value) {
+    return value;
+}
+
 const int TIME_ESCAPE = 30;
 int NON_CONST_VALUE = 40;
 const int* POINTER_TO_CONST = nullptr;
@@ -26,6 +31,14 @@ int calculateTotal() {
     char* funcName = nullptr;
     static char* cachedFuncName = nullptr;
     return funcName == cachedFuncName ? 1 : 0;
+}
+
+int useTemplates(Processor& processor) {
+    Holder<int> TemplateHolder;
+    return (&inlineHelper)() + inlineTemplate<int>(1) + constexprTemplate<int>(2) +
+        ordinaryTemplate(3) + (processor.*(&Processor::inlineMember))() +
+        Processor::staticInlineMember() + processor.inlineMemberTemplate<int>(4) +
+        TemplateHolder.inlineClassMember(5);
 }
 
 int SignedConversion(unsigned int value) {

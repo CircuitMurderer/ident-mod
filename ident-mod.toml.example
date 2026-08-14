@@ -9,8 +9,9 @@ downgrade_warnings = [] # "sign-conversion" or "-Wsign-conversion"
 legacy_prefixes = true # Recognize built-in legacy Hungarian prefixes.
 
 [variables]
-case = "pascal" # pascal / camel / snake
+case = "pascal" # pascal / camel / snake / hungarian
 # Camel and snake append one separator when a non-empty type prefix lacks "_".
+# Hungarian uses a Pascal base after pointer/type markers and a camel base without them.
 
 [scan]
 local = true
@@ -35,10 +36,17 @@ global = ["upper_snake"]
 [functions]
 member = "camel"
 free = "pascal"
+inline = "upper_snake" # Optional; semantic inline overrides member/free.
 
 [pointers]
 marker = "p"
 char = "s" # char* -> ps, char** -> pps
+
+[pointer_types]
+"char*" = "s" # char* -> s, char** -> ps; consumes one pointer level.
+
+[arrays]
+char = "s" # char[] -> s
 
 [types]
 int = "n"

@@ -4,12 +4,18 @@ pub const FunctionCase = enum {
     lower_camel,
     pascal,
     snake,
+    upper_snake,
     unchanged,
 };
 
 pub const TypeMapping = struct {
     type_name: []const u8,
     prefix: []const u8,
+};
+
+pub const TypePrefixMatch = struct {
+    prefix: []const u8,
+    consumed_pointer_depth: usize = 0,
 };
 
 pub const VariableStyle = enum {
@@ -20,6 +26,7 @@ pub const VariableCase = enum {
     lower_camel,
     pascal,
     snake,
+    hungarian,
 };
 
 pub const Config = struct {
@@ -32,6 +39,7 @@ pub const Config = struct {
 
     member_function_case: FunctionCase = .lower_camel,
     free_function_case: FunctionCase = .lower_camel,
+    inline_function_case: ?FunctionCase = null,
     variable_case: VariableCase = .pascal,
 
     scan_local: bool = true,
@@ -65,6 +73,8 @@ pub const Config = struct {
 
     mappings: std.ArrayList(TypeMapping) = .empty,
     pointer_mappings: std.ArrayList(TypeMapping) = .empty,
+    pointer_type_mappings: std.ArrayList(TypeMapping) = .empty,
+    array_mappings: std.ArrayList(TypeMapping) = .empty,
     legacy_mappings: std.ArrayList(TypeMapping) = .empty,
     legacy_pointer_mappings: std.ArrayList(TypeMapping) = .empty,
 
@@ -87,6 +97,8 @@ pub const Config = struct {
 
         self.mappings.deinit(allocator);
         self.pointer_mappings.deinit(allocator);
+        self.pointer_type_mappings.deinit(allocator);
+        self.array_mappings.deinit(allocator);
         self.legacy_mappings.deinit(allocator);
         self.legacy_pointer_mappings.deinit(allocator);
     }
@@ -137,13 +149,63 @@ pub const Config = struct {
     }
 
     pub fn typePrefix(self: *const Config, spelling: []const u8, pointer_depth: usize) ?[]const u8 {
+        return self.typePrefixForShape(spelling, pointer_depth, 0);
+    }
+
+    pub fn typePrefixForShape(
+        self: *const Config,
+        spelling: []const u8,
+        pointer_depth: usize,
+        array_depth: usize,
+    ) ?[]const u8 {
+        const match = self.typePrefixMatchForShape(spelling, pointer_depth, array_depth) orelse return null;
+        return match.prefix;
+    }
+
+    pub fn typePrefixMatchForShape(
+        self: *const Config,
+        spelling: []const u8,
+        pointer_depth: usize,
+        array_depth: usize,
+    ) ?TypePrefixMatch {
         const normalized = normalizeTypeSpelling(spelling);
 
+        if (findPointerTypeMapping(self.pointer_type_mappings.items, normalized, pointer_depth)) |match|
+            return match;
         if (pointer_depth > 0) {
-            if (findMapping(self.pointer_mappings.items, normalized)) |prefix| return prefix;
+            if (findMapping(self.pointer_mappings.items, normalized)) |prefix| return .{ .prefix = prefix };
+        }
+        if (array_depth > 0) {
+            if (findMapping(self.array_mappings.items, normalized)) |prefix| return .{ .prefix = prefix };
+            return null;
         }
 
-        return findMapping(self.mappings.items, normalized);
+        if (findMapping(self.mappings.items, normalized)) |prefix| return .{ .prefix = prefix };
+        return null;
+    }
+
+    fn findPointerTypeMapping(
+        mappings: []const TypeMapping,
+        spelling: []const u8,
+        pointer_depth: usize,
+    ) ?TypePrefixMatch {
+        var best: ?TypePrefixMatch = null;
+        var i = mappings.len;
+        while (i > 0) {
+            i -= 1;
+            const mapping = mappings[i];
+            const shape = pointerTypeShape(mapping.type_name) orelse continue;
+            if (shape.pointer_depth > pointer_depth) continue;
+            if (!typeNameMatchesNormalized(spelling, normalizeTypeSpelling(shape.base_type))) continue;
+            if (best == null or shape.pointer_depth > best.?.consumed_pointer_depth) {
+                best = .{
+                    .prefix = mapping.prefix,
+                    .consumed_pointer_depth = shape.pointer_depth,
+                };
+            }
+        }
+
+        return best;
     }
 
     fn findMapping(mappings: []const TypeMapping, spelling: []const u8) ?[]const u8 {
@@ -175,6 +237,24 @@ pub const Config = struct {
         return result;
     }
 };
+
+const PointerTypeShape = struct {
+    base_type: []const u8,
+    pointer_depth: usize,
+};
+
+fn pointerTypeShape(configured_type: []const u8) ?PointerTypeShape {
+    var remaining = std.mem.trim(u8, configured_type, " \t");
+    var pointer_depth: usize = 0;
+
+    while (remaining.len > 0 and remaining[remaining.len - 1] == '*') {
+        pointer_depth += 1;
+        remaining = std.mem.trimEnd(u8, remaining[0 .. remaining.len - 1], " \t");
+    }
+
+    if (pointer_depth == 0 or remaining.len == 0) return null;
+    return .{ .base_type = remaining, .pointer_depth = pointer_depth };
+}
 
 pub fn typeNameMatches(spelling: []const u8, configured_type: []const u8) bool {
     return typeNameMatchesNormalized(Config.normalizeTypeSpelling(spelling), configured_type);
@@ -261,7 +341,7 @@ pub fn load(io: std.Io, allocator: std.mem.Allocator, path: ?[]const u8) !Config
 
             const value = try parseString(allocator, value_text);
             config.variable_case = parseVariableCase(value) orelse {
-                std.log.err("{s}:{d}: variable case must be camel, pascal, or snake", .{ config_path, line_number });
+                std.log.err("{s}:{d}: variable case must be camel, pascal, snake, or hungarian", .{ config_path, line_number });
                 return error.InvalidConfig;
             };
         } else if (std.mem.eql(u8, section, "scope_alternatives") or
@@ -278,14 +358,34 @@ pub fn load(io: std.Io, allocator: std.mem.Allocator, path: ?[]const u8) !Config
         } else if (std.mem.eql(u8, section, "functions")) {
             const value = try parseString(allocator, value_text);
             const function_case = parseFunctionCase(value) orelse {
-                std.log.err("{s}:{d}: function case must be camel, pascal, snake, or unchanged", .{ config_path, line_number });
+                std.log.err("{s}:{d}: function case must be camel, pascal, snake, upper_snake, or unchanged", .{ config_path, line_number });
                 return error.InvalidConfig;
             };
-            if (std.mem.eql(u8, key, "member")) config.member_function_case = function_case else if (std.mem.eql(u8, key, "free")) config.free_function_case = function_case else return invalidKey(config_path, line_number, section, key);
+            if (std.mem.eql(u8, key, "member")) {
+                config.member_function_case = function_case;
+            } else if (std.mem.eql(u8, key, "free")) {
+                config.free_function_case = function_case;
+            } else if (std.mem.eql(u8, key, "inline")) {
+                config.inline_function_case = function_case;
+            } else {
+                return invalidKey(config_path, line_number, section, key);
+            }
         } else if (std.mem.eql(u8, section, "types")) {
             const type_name = try parseKey(allocator, key);
             const prefix = try parseString(allocator, value_text);
             try config.mappings.append(allocator, .{ .type_name = type_name, .prefix = prefix });
+        } else if (std.mem.eql(u8, section, "arrays")) {
+            const type_name = try parseKey(allocator, key);
+            const prefix = try parseString(allocator, value_text);
+            try config.array_mappings.append(allocator, .{ .type_name = type_name, .prefix = prefix });
+        } else if (std.mem.eql(u8, section, "pointer_types")) {
+            const type_name = try parseKey(allocator, key);
+            if (pointerTypeShape(type_name) == null) {
+                std.log.err("{s}:{d}: pointer_types keys must end with one or more '*'", .{ config_path, line_number });
+                return error.InvalidConfig;
+            }
+            const prefix = try parseString(allocator, value_text);
+            try config.pointer_type_mappings.append(allocator, .{ .type_name = type_name, .prefix = prefix });
         } else if (std.mem.eql(u8, section, "pointers")) {
             const value = try parseString(allocator, value_text);
             if (std.mem.eql(u8, key, "marker")) {
@@ -383,6 +483,7 @@ fn parseFunctionCase(value: []const u8) ?FunctionCase {
     if (std.mem.eql(u8, value, "camel")) return .lower_camel;
     if (std.mem.eql(u8, value, "pascal")) return .pascal;
     if (std.mem.eql(u8, value, "snake")) return .snake;
+    if (std.mem.eql(u8, value, "upper_snake")) return .upper_snake;
     if (std.mem.eql(u8, value, "unchanged")) return .unchanged;
 
     return null;
@@ -392,6 +493,7 @@ fn parseVariableCase(value: []const u8) ?VariableCase {
     if (std.mem.eql(u8, value, "camel")) return .lower_camel;
     if (std.mem.eql(u8, value, "pascal")) return .pascal;
     if (std.mem.eql(u8, value, "snake")) return .snake;
+    if (std.mem.eql(u8, value, "hungarian")) return .hungarian;
 
     return null;
 }
@@ -628,6 +730,36 @@ test "built-in type mappings are neutral" {
     try std.testing.expectEqualStrings("", config.typePrefix("int", 0).?);
     try std.testing.expectEqualStrings("", config.typePrefix("char", 1).?);
     try std.testing.expect(config.legacy_prefixes);
+}
+
+test "pointer and array mappings override ordinary type mappings" {
+    const allocator = std.testing.allocator;
+    var config = try Config.initDefaults(allocator);
+    defer config.deinit(allocator);
+
+    try config.mappings.append(allocator, .{ .type_name = "char", .prefix = "ch" });
+    try config.array_mappings.append(allocator, .{ .type_name = "char", .prefix = "s" });
+    try config.pointer_mappings.append(allocator, .{ .type_name = "char", .prefix = "ps" });
+    try config.pointer_type_mappings.append(allocator, .{ .type_name = "char *", .prefix = "s" });
+    try config.pointer_type_mappings.append(allocator, .{ .type_name = "char**", .prefix = "strings" });
+
+    try std.testing.expectEqualStrings("ch", config.typePrefixForShape("const char", 0, 0).?);
+    try std.testing.expectEqualStrings("s", config.typePrefixForShape("const char", 0, 1).?);
+    try std.testing.expect(config.typePrefixForShape("int", 0, 1) == null);
+    const single_pointer = config.typePrefixMatchForShape("const char", 1, 1).?;
+    try std.testing.expectEqualStrings("s", single_pointer.prefix);
+    try std.testing.expectEqual(@as(usize, 1), single_pointer.consumed_pointer_depth);
+
+    const triple_pointer = config.typePrefixMatchForShape("char", 3, 0).?;
+    try std.testing.expectEqualStrings("strings", triple_pointer.prefix);
+    try std.testing.expectEqual(@as(usize, 2), triple_pointer.consumed_pointer_depth);
+}
+
+test "pointer type shapes require trailing pointer levels" {
+    try std.testing.expect(pointerTypeShape("char") == null);
+    try std.testing.expectEqual(@as(usize, 1), pointerTypeShape("const char *").?.pointer_depth);
+    try std.testing.expectEqualStrings("const char", pointerTypeShape("const char *").?.base_type);
+    try std.testing.expectEqual(@as(usize, 2), pointerTypeShape("char * *").?.pointer_depth);
 }
 
 test "migration section can disable legacy prefixes" {

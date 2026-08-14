@@ -33,9 +33,16 @@ global = ["upper_snake"]
 [functions]
 member = "camel"
 free = "pascal"
+inline = "upper_snake"
 
 [pointers]
 marker = "p"
+char = "s"
+
+[pointer_types]
+"char*" = "s"
+
+[arrays]
 char = "s"
 
 [types]

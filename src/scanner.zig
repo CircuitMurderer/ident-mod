@@ -131,6 +131,7 @@ const Context = struct {
     config: *const config_mod.Config,
     project_root: []const u8,
     working_directory: []const u8,
+    translation_unit: c.CXTranslationUnit,
     result: *ScanResult,
     seen: *std.StringHashMap(void),
     callback_error: ?anyerror = null,
@@ -250,6 +251,7 @@ pub fn scan(
             .config = config,
             .project_root = project_root,
             .working_directory = entry.directory,
+            .translation_unit = tu,
             .result = &result,
             .seen = &seen,
         };
@@ -438,7 +440,10 @@ fn visitForReplacements(cursor: c.CXCursor, parent: c.CXCursor, client_data: c.C
 
 fn inspectReplacementCursor(context: *FixContext, cursor: c.CXCursor) !void {
     const kind = c.clang_getCursorKind(cursor);
-    const symbol = if (c.clang_isDeclaration(kind) != 0)
+    const is_declaration = c.clang_isDeclaration(kind) != 0;
+    if (!is_declaration and !isRenameReference(kind)) return;
+
+    const symbol = if (is_declaration)
         cursor
     else
         c.clang_getCursorReferenced(cursor);
@@ -447,11 +452,18 @@ fn inspectReplacementCursor(context: *FixContext, cursor: c.CXCursor) !void {
     const usr = try cursorString(context.allocator, c.clang_getCursorUSR(symbol));
     defer context.allocator.free(usr);
 
-    const candidate_index = context.candidates.get(usr) orelse return;
+    const candidate_index = context.candidates.get(usr) orelse candidate: {
+        const primary_template = c.clang_getSpecializedCursorTemplate(symbol);
+        if (c.clang_Cursor_isNull(primary_template) != 0) return;
+
+        const template_usr = try cursorString(context.allocator, c.clang_getCursorUSR(primary_template));
+        defer context.allocator.free(template_usr);
+        break :candidate context.candidates.get(template_usr) orelse return;
+    };
     context.occurrence_counts[candidate_index] += 1;
     const diagnostic = context.diagnostics[candidate_index];
 
-    const location_result = try getReplacementLocation(context, c.clang_getCursorLocation(cursor));
+    const location_result = try getReplacementLocation(context, replacementCursorLocation(cursor));
 
     switch (location_result) {
         .macro_expansion => {
@@ -494,6 +506,21 @@ fn inspectReplacementCursor(context: *FixContext, cursor: c.CXCursor) !void {
             try context.owners.append(context.allocator, candidate_index);
         },
     }
+}
+
+fn isRenameReference(kind: c.CXCursorKind) bool {
+    return kind == c.CXCursor_DeclRefExpr or
+        kind == c.CXCursor_MemberRefExpr or
+        kind == c.CXCursor_OverloadedDeclRef;
+}
+
+fn replacementCursorLocation(cursor: c.CXCursor) c.CXSourceLocation {
+    if (c.clang_isDeclaration(c.clang_getCursorKind(cursor)) != 0)
+        return c.clang_getCursorLocation(cursor);
+
+    const name_range = c.clang_getCursorReferenceNameRange(cursor, 0, 0);
+    if (c.clang_Range_isNull(name_range) == 0) return c.clang_getRangeStart(name_range);
+    return c.clang_getCursorLocation(cursor);
 }
 
 const ReplacementLocationResult = union(enum) {
@@ -622,17 +649,18 @@ fn inspectVariable(context: *Context, cursor: c.CXCursor, scope: naming.Variable
     const selected_type = if (context.config.use_canonical_type) c.clang_getCanonicalType(raw_type) else raw_type;
     const type_spelling = try cursorString(context.allocator, c.clang_getTypeSpelling(selected_type));
     defer context.allocator.free(type_spelling);
-    const pointer_info = peelPointers(selected_type);
-    const base_type_spelling = try cursorString(context.allocator, c.clang_getTypeSpelling(pointer_info.base_type));
+    const type_shape = peelTypeShape(selected_type);
+    const base_type_spelling = try cursorString(context.allocator, c.clang_getTypeSpelling(type_shape.base_type));
     defer context.allocator.free(base_type_spelling);
 
-    const suggested = try naming.variableName(
+    const suggested = try naming.variableNameWithArray(
         context.allocator,
         context.config,
         scope,
         is_top_level_const,
         base_type_spelling,
-        pointer_info.depth,
+        type_shape.pointer_depth,
+        type_shape.array_depth,
         old_name,
     );
 
@@ -647,23 +675,48 @@ fn inspectVariable(context: *Context, cursor: c.CXCursor, scope: naming.Variable
     }
 }
 
-const PointerInfo = struct {
+const TypeShape = struct {
     base_type: c.CXType,
-    depth: usize,
+    pointer_depth: usize,
+    array_depth: usize,
 };
 
-fn peelPointers(selected_type: c.CXType) PointerInfo {
+fn peelTypeShape(selected_type: c.CXType) TypeShape {
     var current = selected_type;
-    var depth: usize = 0;
-    while (current.kind == c.CXType_Pointer) {
-        depth += 1;
-        current = c.clang_getPointeeType(current);
+    var pointer_depth: usize = 0;
+    var array_depth: usize = 0;
+
+    while (true) {
+        switch (current.kind) {
+            c.CXType_Pointer => {
+                pointer_depth += 1;
+                current = c.clang_getPointeeType(current);
+            },
+            c.CXType_ConstantArray,
+            c.CXType_IncompleteArray,
+            c.CXType_VariableArray,
+            c.CXType_DependentSizedArray,
+            => {
+                array_depth += 1;
+                current = c.clang_getArrayElementType(current);
+            },
+            else => break,
+        }
     }
-    return .{ .base_type = current, .depth = depth };
+
+    return .{
+        .base_type = current,
+        .pointer_depth = pointer_depth,
+        .array_depth = array_depth,
+    };
 }
 
 fn inspectFunction(context: *Context, cursor: c.CXCursor, function_case: config_mod.FunctionCase) !void {
-    if (function_case == .unchanged) return;
+    const selected_case = if (context.config.inline_function_case) |inline_case|
+        if (try isInlineFunction(context, cursor)) inline_case else function_case
+    else
+        function_case;
+    if (selected_case == .unchanged) return;
 
     const location = getLocation(context, cursor) orelse return;
     defer context.allocator.free(location.file);
@@ -675,12 +728,94 @@ fn inspectFunction(context: *Context, cursor: c.CXCursor, function_case: config_
     const usr = try cursorString(context.allocator, c.clang_getCursorUSR(cursor));
     defer context.allocator.free(usr);
 
-    const new_name = try naming.functionName(context.allocator, function_case, old_name);
+    const new_name = try naming.functionName(context.allocator, selected_case, old_name);
     if (std.mem.eql(u8, old_name, new_name)) {
         context.allocator.free(new_name);
         return;
     }
     try appendDiagnostic(context, location, usr, .function, old_name, new_name, null);
+}
+
+fn isInlineFunction(context: *Context, cursor: c.CXCursor) !bool {
+    const primary_template = c.clang_getSpecializedCursorTemplate(cursor);
+    if (c.clang_Cursor_isNull(primary_template) == 0 and
+        c.clang_equalCursors(primary_template, cursor) == 0)
+    {
+        return isInlineFunction(context, primary_template);
+    }
+
+    const kind = c.clang_getCursorKind(cursor);
+    if (kind == c.CXCursor_FunctionTemplate) {
+        if (try isInlineFunctionTemplate(context, cursor)) return true;
+    } else if (c.clang_Cursor_isFunctionInlined(cursor) != 0) {
+        return true;
+    }
+
+    const definition = c.clang_getCursorDefinition(cursor);
+    if (c.clang_Cursor_isNull(definition) != 0 or c.clang_equalCursors(definition, cursor) != 0)
+        return false;
+
+    if (kind == c.CXCursor_FunctionTemplate)
+        return isInlineFunctionTemplate(context, definition);
+    return c.clang_Cursor_isFunctionInlined(definition) != 0;
+}
+
+fn isInlineFunctionTemplate(context: *Context, cursor: c.CXCursor) !bool {
+    if (c.clang_isCursorDefinition(cursor) != 0) {
+        const lexical_parent = c.clang_getCursorLexicalParent(cursor);
+        if (isRecord(c.clang_getCursorKind(lexical_parent))) return true;
+    }
+
+    return cursorHasInlineSpecifier(context, cursor);
+}
+
+fn cursorHasInlineSpecifier(context: *Context, cursor: c.CXCursor) !bool {
+    var cursor_file: c.CXFile = null;
+    const cursor_location = c.clang_getCursorLocation(cursor);
+    c.clang_getSpellingLocation(cursor_location, &cursor_file, null, null, null);
+    if (cursor_file == null) return false;
+
+    const cursor_extent = c.clang_getCursorExtent(cursor);
+    const declaration_prefix = c.clang_getRange(c.clang_getRangeStart(cursor_extent), cursor_location);
+
+    var tokens: [*c]c.CXToken = null;
+    var token_count: c_uint = 0;
+    c.clang_tokenize(
+        context.translation_unit,
+        declaration_prefix,
+        &tokens,
+        &token_count,
+    );
+    if (tokens == null) return false;
+    defer c.clang_disposeTokens(context.translation_unit, tokens, token_count);
+
+    for (tokens[0..token_count]) |token| {
+        var token_file: c.CXFile = null;
+        c.clang_getSpellingLocation(
+            c.clang_getTokenLocation(context.translation_unit, token),
+            &token_file,
+            null,
+            null,
+            null,
+        );
+        if (token_file != cursor_file) continue;
+        if (c.clang_getTokenKind(token) != c.CXToken_Keyword) continue;
+
+        const spelling = try cursorString(
+            context.allocator,
+            c.clang_getTokenSpelling(context.translation_unit, token),
+        );
+        defer context.allocator.free(spelling);
+
+        if (std.mem.eql(u8, spelling, "inline") or
+            std.mem.eql(u8, spelling, "constexpr") or
+            std.mem.eql(u8, spelling, "consteval"))
+        {
+            return true;
+        }
+    }
+
+    return false;
 }
 
 const Location = struct { file: []u8, line: u32, column: u32, offset: u32 };

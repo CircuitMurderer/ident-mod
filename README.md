@@ -101,7 +101,7 @@ downgrade_all_warnings = false
 downgrade_warnings = ["sign-conversion", "conversion"]
 
 [variables]
-case = "pascal"       # pascal / camel / snake
+case = "pascal"       # pascal / camel / snake / hungarian
 
 [scan]
 local = false         # 普通局部变量
@@ -131,10 +131,17 @@ global = ["upper_snake"]
 [functions]
 member = "camel"  # GetSize -> getSize
 free = "pascal"   # calculate_total -> CalculateTotal
+inline = "upper_snake" # 可选；inline 规则优先于 member/free
 
 [pointers]
 marker = "p"
 char = "s"        # char* -> ps，char** -> pps
+
+[pointer_types]
+"char*" = "s"     # 消耗一层指针：char* -> s，char** -> ps
+
+[arrays]
+char = "s"        # char[] -> s；数组维度不增加 p
 
 [types]
 bool = "b"
@@ -146,6 +153,8 @@ double = "d"
 "project::Request" = "req"
 "project::Response" = "rsp"
 ```
+
+`functions.inline` 使用 C++ 语义判断，包括显式 `inline`、`constexpr`、`consteval` 和类内定义的方法。模板族按主模板统一命名；修复主模板时，已出现的实例化和特化引用也会一并处理，不会主动实例化所有类型组合。
 
 Clang warning 被 `-Werror` 提升时，可以全部或按分组恢复成 warning；真正的语法、类型和头文件错误仍会阻止修复：
 
@@ -211,13 +220,17 @@ free = "snake"        # CalculateTotal -> calculate_total
 命名组合：
 
 ```text
-作用域前缀 + 每级指针的 p + 类型前缀 + 按 variables.case 格式化的名称
+作用域前缀 + 未被 pointer_types 消耗的每级指针 p + 类型前缀 + 按 variables.case 格式化的名称
 
-char* funcName             -> psFuncName
-static char* funcName      -> s_psFuncName
-成员 char* funcName        -> m_psFuncName
-全局 char** names          -> g_ppsNames
+char* funcName             -> sFuncName
+char** names               -> psNames
+char funcName[64]          -> sFuncName
+static char* funcName      -> s_sFuncName
+成员 char* funcName        -> m_sFuncName
+全局 char** names          -> g_psNames
 ```
+
+`pointer_types` 优先级最高。键中包含几层 `*`，匹配后就消耗几层；额外的指针层级仍按 `pointers.marker` 添加。未配置该节时，原有指针规则不变。
 
 当类型前缀为 `""` 时，`camel` 和 `snake` 会在整段指针标记后自动补一个 `_`；`pascal` 继续使用大写主体作为边界：
 
@@ -226,7 +239,14 @@ pascal + int* funcName -> m_pFuncName
 camel  + int* funcName -> m_p_funcName
 snake  + int* funcName -> m_p_func_name
 snake  + int** names   -> m_pp_names
+hungarian + String nameOfVar  -> m_sNameOfVar  # String = "s"
+hungarian + Widget nameOfVar  -> m_nameOfVar   # 未映射类型
+hungarian + int* nameOfVar    -> m_pNameOfVar  # int = ""
+hungarian + char* nameOfVar   -> m_sNameOfVar  # pointer_types."char*" = "s"
+hungarian + char** namesOfVar -> m_psNamesOfVar
 ```
+
+`hungarian` 在存在指针或非空类型前缀时使用 Pascal 主体，否则使用 camel 主体。该模式会把未映射类型视为空前缀；其他变量模式仍将其报告为 `unmapped_type`。
 
 const 判断使用 Clang 类型语义：
 
@@ -238,7 +258,8 @@ int* const CONST_POINTER = NULL;  // 指针本身 const
 ```
 
 ```text
-函数风格：camel | pascal | snake | unchanged
+变量风格：camel | pascal | snake | hungarian
+函数风格：camel | pascal | snake | upper_snake | unchanged
 作用域键：local | static_local | member | static_member | global | static_global
 ```
 

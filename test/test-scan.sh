@@ -30,10 +30,23 @@ awk -F '\t' '
     pointer_to_const = 0
     local_hungarian = 0
     local_pointer = 0
+    exact_pointer = 0
+    remaining_pointer = 0
+    string_array = 0
     static_local = 0
     static_member = 0
     static_global = 0
     pascal_function = 0
+    inline_function = 0
+    constexpr_function = 0
+    inline_template = 0
+    constexpr_template = 0
+    ordinary_template = 0
+    inline_member = 0
+    static_inline_member = 0
+    inline_member_template = 0
+    inline_class_member = 0
+    ordinary_member = 0
   }
   NF < 5 || length($1) != 64 || $1 !~ /^[[:xdigit:]]+$/ { exit 1 }
   $3 == "TIME_ESCAPE" { exit 1 }
@@ -41,14 +54,32 @@ awk -F '\t' '
   $3 == "NON_CONST_VALUE" { non_const = 1 }
   $3 == "POINTER_TO_CONST" { pointer_to_const = 1 }
   $3 == "result" && $4 == "nResult" { local_hungarian = 1 }
-  $3 == "funcName" && $4 == "psFuncName" { local_pointer = 1 }
-  $3 == "cachedFuncName" && $4 == "s_psCachedFuncName" { static_local = 1 }
+  $3 == "funcName" && $4 == "sFuncName" { local_pointer = 1 }
+  $3 == "name" && $4 == "m_sName" { exact_pointer = 1 }
+  $3 == "names" && $4 == "g_psNames" { remaining_pointer = 1 }
+  $3 == "displayName" && $4 == "m_sDisplayName" { string_array = 1 }
+  $3 == "cachedFuncName" && $4 == "s_sCachedFuncName" { static_local = 1 }
   $3 == "AverageValue" && $4 == "s_dAverageValue" { static_member = 1 }
-  $3 == "globalFuncName" && $4 == "s_psGlobalFuncName" { static_global = 1 }
+  $3 == "globalFuncName" && $4 == "s_sGlobalFuncName" { static_global = 1 }
   $3 == "calculateTotal" && $4 == "CalculateTotal" { pascal_function = 1 }
+  $3 == "inlineHelper" && $4 == "INLINE_HELPER" { inline_function = 1 }
+  $3 == "constexprValue" && $4 == "CONSTEXPR_VALUE" { constexpr_function = 1 }
+  $3 == "inlineTemplate" && $4 == "INLINE_TEMPLATE" { inline_template += 1 }
+  $3 == "constexprTemplate" && $4 == "CONSTEXPR_TEMPLATE" { constexpr_template = 1 }
+  $3 == "ordinaryTemplate" && $4 == "OrdinaryTemplate" { ordinary_template = 1 }
+  $3 == "inlineMember" && $4 == "INLINE_MEMBER" { inline_member = 1 }
+  $3 == "staticInlineMember" && $4 == "STATIC_INLINE_MEMBER" { static_inline_member = 1 }
+  $3 == "inlineMemberTemplate" && $4 == "INLINE_MEMBER_TEMPLATE" { inline_member_template = 1 }
+  $3 == "inlineClassMember" && $4 == "INLINE_CLASS_MEMBER" { inline_class_member = 1 }
+  $3 == "GetSize" && $4 == "getSize" { ordinary_member = 1 }
   END {
     if (!non_const || !pointer_to_const || !local_hungarian || !local_pointer ||
-        !static_local || !static_member || !static_global || !pascal_function) exit 1
+        !exact_pointer || !remaining_pointer || !string_array ||
+        !static_local || !static_member || !static_global || !pascal_function ||
+        !inline_function || !constexpr_function || inline_template < 2 ||
+        !constexpr_template || !ordinary_template || !inline_member ||
+        !static_inline_member || !inline_member_template ||
+        !inline_class_member || !ordinary_member) exit 1
   }
 ' idents.tsv
 grep -q '^Warnings: 1$' scan-progress.txt
@@ -81,7 +112,7 @@ set -e
 [ "$status" -eq 1 ]
 awk -F '\t' '
   $3 == "result" || $3 == "funcName" { exit 1 }
-  $3 == "cachedFuncName" && $4 == "s_psCachedFuncName" { static_local = 1 }
+  $3 == "cachedFuncName" && $4 == "s_sCachedFuncName" { static_local = 1 }
   END { if (!static_local) exit 1 }
 ' idents.tsv
 
@@ -114,6 +145,25 @@ set -e
 
 [ "$status" -eq 2 ]
 grep -q '^Errors: 1$' hard-error-progress.txt
+
+sed 's/^case = "pascal"$/case = "hungarian"/' \
+  test/fixture/ident-mod.toml >ident-mod-hungarian-variables.toml
+
+set +e
+"$tool" check \
+  -p test/fixture/compile_commands.json \
+  -c ident-mod-hungarian-variables.toml \
+  --root . >/dev/null 2>hungarian-variables-progress.txt
+status=$?
+set -e
+
+[ "$status" -eq 1 ]
+awk -F '\t' '
+  $3 == "numberOfSlice" && $4 == "m_nNumberOfSlice" { typed_member = 1 }
+  $3 == "TemplateHolder" && $4 == "templateHolder" { untyped_local = 1 }
+  $3 == "funcName" && $4 == "sFuncName" { typed_pointer = 1 }
+  END { if (!typed_member || !untyped_local || !typed_pointer) exit 1 }
+' idents.tsv
 
 sed 's/^case = "pascal"$/case = "camel"/' \
   test/fixture/ident-mod.toml >ident-mod-camel-variables.toml
